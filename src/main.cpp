@@ -1,200 +1,239 @@
-#include <ros.h>
-#include <nav_msgs/Odometry.h>
-#include <tf/transform_broadcaster.h>
-#include <math.h>
-// #include <tf/transform_datatypes.h>
+#include <micro_ros_platformio.h>
+#include <Arduino.h>
+#include <stdio.h>
+#include <rcl/rcl.h>
+#include <rcl/error_handling.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+#include <rmw_microros/rmw_microros.h>
 
-// --- Robot Parameters ---
-// (These values are based on your robot_config.h)
-#define WHEEL_RADIUS 0.33             // meters
-#define ENCODER_COUNTS_PER_REV 1700   // counts per full wheel revolution
-#define WHEEL_SEPARATION 0.122        // meters (distance between left and right wheels)
-#define TICK2RAD 0.00394177           // radians per encoder tick (from your config)
-#define PI 3.14159265359
+#include <std_msgs/msg/string.h>
+#include <rosidl_runtime_c/string_functions.h>  // For string assignment
 
-// --- Encoder Data ---
-// We assume you have four encoders, one per wheel. The indices are defined as follows:
+// Uncomment if needed
+// #define LED_PIN 13
+
+#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){return false;}}
+#define EXECUTE_EVERY_N_MS(MS, X)  do {            \
+  static volatile int64_t init = -1;                 \
+  if (init == -1) { init = uxr_millis(); }           \
+  if (uxr_millis() - init > MS) { X; init = uxr_millis(); }  \
+} while (0)
+
+// ---------------- Micro-ROS Variables ----------------
+rclc_support_t support;
+rcl_node_t node;
+rcl_timer_t timer;
+rclc_executor_t executor;
+rcl_allocator_t allocator;
+rcl_publisher_t publisher;
+std_msgs__msg__String msg;
+bool micro_ros_init_successful;
+
+enum states {
+  WAITING_AGENT,
+  AGENT_AVAILABLE,
+  AGENT_CONNECTED,
+  AGENT_DISCONNECTED
+} state;
+
+// ---------------- Encoder & Kinematics Definitions ----------------
+#define WHEEL_NUM 4
 #define RIGHT_FRONT 0
 #define LEFT_FRONT  1
 #define LEFT_REAR   2
 #define RIGHT_REAR  3
-#define WHEEL_NUM   4
 
-// Global encoder count array (updated by your encoder ISRs)
+#define ENCODER_COUNTS_PER_REV 1700  // counts per wheel revolution
+#define UPDATE_INTERVAL 500          // ms over which velocity is computed
+
+// Global encoder tick counters and previous values
 volatile long encoder_data[WHEEL_NUM] = {0, 0, 0, 0};
+long previous_encoder_data[WHEEL_NUM] = {0, 0, 0, 0};
 
-// For differential-drive odometry, we average the counts of the two wheels on each side.
-long last_left_count = 0;   // Average of LEFT_FRONT and LEFT_REAR
-long last_right_count = 0;  // Average of RIGHT_FRONT and RIGHT_REAR
-
-// --- Odometry State ---
-double x_pos = 0.0;   // meters
-double y_pos = 0.0;   // meters
-double theta = 0.0;   // robot heading in radians
-
-// --- ROS Objects ---
-ros::NodeHandle nh;
-nav_msgs::Odometry odom;
-ros::Publisher odom_pub("odom", &odom);
-tf::TransformBroadcaster tf_broadcaster;
-geometry_msgs::TransformStamped odom_tf;
-
-// Timing
-unsigned long last_time = 0;
-const double PUBLISH_PERIOD = 0.1; // seconds (10 Hz)
-
-// -----------------------------------------------------------------------------
-// Encoder ISR functions
-// (These should be attached to the proper encoder A channel pins using attachInterrupt)
-// For simplicity, here are dummy ISR functions. In your actual code, these ISRs
-// update encoder_data[] for each wheel.
-void MotorISR_RIGHT_FRONT() {
-  // Example: simple quadrature decoding (replace with your actual logic)
-  int b = digitalRead(7);  // Assuming RIGHT_FRONT_ENC_B is on pin 7
-  if (digitalRead(6))  // RIGHT_FRONT_ENC_A on pin 6
-    b ? encoder_data[RIGHT_FRONT]-- : encoder_data[RIGHT_FRONT]++;
+// ---------------- Encoder ISR Functions ----------------
+// These functions update the tick counts using digitalReadFast.
+// Adjust the pin numbers as needed for your hardware.
+void encoderISR_RightFront() {
+  int b = digitalReadFast(7); // RIGHT_FRONT_ENC_B (pin 7)
+  if (digitalReadFast(6) == b)
+    encoder_data[RIGHT_FRONT]++;
   else
-    b ? encoder_data[RIGHT_FRONT]++ : encoder_data[RIGHT_FRONT]--;
+    encoder_data[RIGHT_FRONT]--;
 }
 
-void MotorISR_LEFT_FRONT() {
-  int b = digitalRead(9);  // LEFT_FRONT_ENC_B on pin 9
-  if (digitalRead(8))  // LEFT_FRONT_ENC_A on pin 8
-    b ? encoder_data[LEFT_FRONT]-- : encoder_data[LEFT_FRONT]++;
+void encoderISR_LeftFront() {
+  int b = digitalReadFast(9); // LEFT_FRONT_ENC_B (pin 9)
+  if (digitalReadFast(8) == b)
+    encoder_data[LEFT_FRONT]++;
   else
-    b ? encoder_data[LEFT_FRONT]++ : encoder_data[LEFT_FRONT]--;
+    encoder_data[LEFT_FRONT]--;
 }
 
-void MotorISR_LEFT_REAR() {
-  int b = digitalRead(33);  // LEFT_REAR_ENC_B on pin 33
-  if (digitalRead(32))  // LEFT_REAR_ENC_A on pin 32
-    b ? encoder_data[LEFT_REAR]-- : encoder_data[LEFT_REAR]++;
+void encoderISR_LeftRear() {
+  int b = digitalReadFast(33); // LEFT_REAR_ENC_B (pin 33)
+  if (digitalReadFast(32) == b)
+    encoder_data[LEFT_REAR]++;
   else
-    b ? encoder_data[LEFT_REAR]++ : encoder_data[LEFT_REAR]--;
+    encoder_data[LEFT_REAR]--;
 }
 
-void MotorISR_RIGHT_REAR() {
-  int b = digitalRead(37);  // RIGHT_REAR_ENC_B on pin 37
-  if (digitalRead(36))  // RIGHT_REAR_ENC_A on pin 36
-    b ? encoder_data[RIGHT_REAR]-- : encoder_data[RIGHT_REAR]++;
+void encoderISR_RightRear() {
+  int b = digitalReadFast(37); // RIGHT_REAR_ENC_B (pin 37)
+  if (digitalReadFast(36) == b)
+    encoder_data[RIGHT_REAR]++;
   else
-    b ? encoder_data[RIGHT_REAR]++ : encoder_data[RIGHT_REAR]--;
+    encoder_data[RIGHT_REAR]--;
 }
 
-// Helper function to create a quaternion from a yaw angle (in radians)
-geometry_msgs::Quaternion createQuaternionFromYaw(double yaw) {
-  geometry_msgs::Quaternion q;
-  q.x = 0.0;
-  q.y = 0.0;
-  q.z = sin(yaw / 2.0);
-  q.w = cos(yaw / 2.0);
-  return q;
+// ---------------- Timer Callback ----------------
+// Every 1 second this callback computes for each wheel:
+// - Total rotations (encoder_data / ENCODER_COUNTS_PER_REV)
+// - Estimated velocity (rotations per second)
+// It then builds a text string summarizing the data and publishes it on "chatter".
+void timer_callback(rcl_timer_t * timer, int64_t last_call_time)
+{
+  (void) last_call_time;
+  if (timer != NULL) {
+    String outStr = "";
+    for (int i = 0; i < WHEEL_NUM; i++) {
+      long current = encoder_data[i];
+      long delta = current - previous_encoder_data[i];
+      previous_encoder_data[i] = current;
+      float rotations = (float) current / ENCODER_COUNTS_PER_REV;
+      float velocity_rps = ((float) delta / ENCODER_COUNTS_PER_REV) * (1000.0 / UPDATE_INTERVAL);
+      
+      // Label each wheel
+      switch(i) {
+        case RIGHT_FRONT:
+          outStr += "RF: Rot=";
+          break;
+        case LEFT_FRONT:
+          outStr += "LF: Rot=";
+          break;
+        case LEFT_REAR:
+          outStr += "LR: Rot=";
+          break;
+        case RIGHT_REAR:
+          outStr += "RR: Rot=";
+          break;
+      }
+      outStr += String(rotations, 4);
+      outStr += ", Vel=";
+      outStr += String(velocity_rps, 4);
+      if (i < WHEEL_NUM - 1) {
+        outStr += " || ";
+      }
+    }
+    
+    // Assign the built string to the message using the helper function.
+    rosidl_runtime_c__String__assign(&msg.data, outStr.c_str());
+    // Publish the message.
+    rcl_publish(&publisher, &msg, NULL);
+  }
 }
 
+// ---------------- Micro-ROS Entities Creation ----------------
+bool create_entities()
+{
+  allocator = rcl_get_default_allocator();
+  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
+  RCCHECK(rclc_node_init_default(&node, "encoder_text_publisher", "", &support));
+  
+  // Create publisher on "chatter" using std_msgs/String
+  RCCHECK(rclc_publisher_init_best_effort(
+    &publisher,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
+    "chatter"));
+  
+  // Create a timer with a 1000 ms period that calls timer_callback
+  const unsigned int timer_timeout = 1000;
+  RCCHECK(rclc_timer_init_default(
+    &timer,
+    &support,
+    RCL_MS_TO_NS(timer_timeout),
+    timer_callback));
+  
+  executor = rclc_executor_get_zero_initialized_executor();
+  RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
+  RCCHECK(rclc_executor_add_timer(&executor, &timer));
+  
+  return true;
+}
 
-// -----------------------------------------------------------------------------
-// Setup function
+void destroy_entities()
+{
+  rmw_context_t * rmw_context = rcl_context_get_rmw_context(&support.context);
+  (void) rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
+  
+  rcl_publisher_fini(&publisher, &node);
+  rcl_timer_fini(&timer);
+  rclc_executor_fini(&executor);
+  rcl_node_fini(&node);
+  rclc_support_fini(&support);
+}
+
+// ---------------- Setup Function ----------------
 void setup() {
-  Serial.begin(115200);
-
-  // Initialize ROS node
-  nh.initNode();
-  nh.advertise(odom_pub);
-  tf_broadcaster.init(nh);
-
-  // --- Encoder Pin Initialization ---  
-  // (Define the pin numbers here as in your robot_config.h)
-  // RIGHT_FRONT_ENC_A on pin 6, RIGHT_FRONT_ENC_B on pin 7, etc.
+  // Initialize micro-ROS serial transports.
+  set_microros_serial_transports(Serial);
+  pinMode(LED_BUILTIN, OUTPUT);
+  
+  // Configure encoder pins as inputs with internal pull-ups.
+  // Encoder A channels:
   pinMode(6, INPUT_PULLUP);   // RIGHT_FRONT_ENC_A
-  pinMode(7, INPUT_PULLUP);   // RIGHT_FRONT_ENC_B
-
   pinMode(8, INPUT_PULLUP);   // LEFT_FRONT_ENC_A
-  pinMode(9, INPUT_PULLUP);   // LEFT_FRONT_ENC_B
-
   pinMode(32, INPUT_PULLUP);  // LEFT_REAR_ENC_A
-  pinMode(33, INPUT_PULLUP);  // LEFT_REAR_ENC_B
-
   pinMode(36, INPUT_PULLUP);  // RIGHT_REAR_ENC_A
+  // Encoder B channels:
+  pinMode(7, INPUT_PULLUP);   // RIGHT_FRONT_ENC_B
+  pinMode(9, INPUT_PULLUP);   // LEFT_FRONT_ENC_B
+  pinMode(33, INPUT_PULLUP);  // LEFT_REAR_ENC_B
   pinMode(37, INPUT_PULLUP);  // RIGHT_REAR_ENC_B
-
-  // Attach interrupts to encoder A channels (assuming these pins are interrupt-capable on Teensy)
-  attachInterrupt(digitalPinToInterrupt(6), MotorISR_RIGHT_FRONT, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(8), MotorISR_LEFT_FRONT, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(32), MotorISR_LEFT_REAR, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(36), MotorISR_RIGHT_REAR, CHANGE);
-
-  last_time = millis();
+  
+  // Attach interrupts on the encoder A channels.
+  attachInterrupt(digitalPinToInterrupt(6), encoderISR_RightFront, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(8), encoderISR_LeftFront, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(32), encoderISR_LeftRear, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(36), encoderISR_RightRear, CHANGE);
+  
+  state = WAITING_AGENT;
+  
+  // Initialize the std_msgs/String message.
+  if (!rosidl_runtime_c__String__init(&msg.data)) {
+    Serial.println("Failed to initialize string!");
+  }
+  // Optionally assign an initial message.
+  rosidl_runtime_c__String__assign(&msg.data, "Initial encoder data");
 }
 
-// -----------------------------------------------------------------------------
-// Main loop: calculate odometry and publish it as a nav_msgs/Odometry message.
+// ---------------- Main Loop ----------------
 void loop() {
-  nh.spinOnce();
-  
-  unsigned long now = millis();
-  double elapsed = (now - last_time) / 1000.0;  // elapsed time in seconds
-  
-  if (elapsed >= PUBLISH_PERIOD) {
-    // Compute average encoder counts for each side:
-    long left_count = (encoder_data[LEFT_FRONT] + encoder_data[LEFT_REAR]) / 2;
-    long right_count = (encoder_data[RIGHT_FRONT] + encoder_data[RIGHT_REAR]) / 2;
-    
-    // Calculate difference from last update:
-    long d_left = left_count - last_left_count;
-    long d_right = right_count - last_right_count;
-    
-    last_left_count = left_count;
-    last_right_count = right_count;
-    
-    // Convert tick differences to distances (meters)
-    // Each tick corresponds to a rotation: tick2rad * WHEEL_RADIUS gives linear distance per tick.
-    double dist_left = d_left * TICK2RAD * WHEEL_RADIUS;
-    double dist_right = d_right * TICK2RAD * WHEEL_RADIUS;
-    
-    // Differential drive kinematics:
-    double d_center = (dist_left + dist_right) / 2.0;
-    double d_theta = (dist_right - dist_left) / WHEEL_SEPARATION;
-    
-    // Update pose using midpoint integration
-    x_pos += d_center * cos(theta + d_theta / 2.0);
-    y_pos += d_center * sin(theta + d_theta / 2.0);
-    theta += d_theta;
-    
-    // Compute velocities
-    double vx = d_center / elapsed;
-    double vth = d_theta / elapsed;
-    
-    // Fill in the odometry message
-    odom.header.stamp = nh.now();
-    odom.header.frame_id = "odom";
-    odom.child_frame_id = "base_link";
-    odom.pose.pose.position.x = x_pos;
-    odom.pose.pose.position.y = y_pos;
-    odom.pose.pose.position.z = 0.0;
-    
-    // Create a quaternion from yaw
-    // geometry_msgs::Quaternion odom_quat = tf::createQuaternionMsgFromYaw(theta);
-    odom.pose.pose.orientation = createQuaternionFromYaw(theta);
-    
-    odom.twist.twist.linear.x = vx;
-    odom.twist.twist.linear.y = 0.0;
-    odom.twist.twist.angular.z = vth;
-    
-    // Publish odometry
-    odom_pub.publish(&odom);
-    
-    // Prepare and broadcast the corresponding TF transform
-    odom_tf.header.stamp = nh.now();
-    odom_tf.header.frame_id = "odom";
-    odom_tf.child_frame_id = "base_link";
-    odom_tf.transform.translation.x = x_pos;
-    odom_tf.transform.translation.y = y_pos;
-    odom_tf.transform.translation.z = 0.0;
-    odom_tf.transform.rotation = createQuaternionFromYaw(theta);
-    tf_broadcaster.sendTransform(odom_tf);
-    
-    last_time = now;
+  switch (state) {
+    case WAITING_AGENT:
+      EXECUTE_EVERY_N_MS(500, state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) ? AGENT_AVAILABLE : WAITING_AGENT;);
+      break;
+    case AGENT_AVAILABLE:
+      state = (true == create_entities()) ? AGENT_CONNECTED : WAITING_AGENT;
+      if (state == WAITING_AGENT) {
+        destroy_entities();
+      }
+      break;
+    case AGENT_CONNECTED:
+      EXECUTE_EVERY_N_MS(200, state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) ? AGENT_CONNECTED : AGENT_DISCONNECTED;);
+      if (state == AGENT_CONNECTED) {
+        rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100));
+      }
+      break;
+    case AGENT_DISCONNECTED:
+      destroy_entities();
+      state = WAITING_AGENT;
+      break;
+    default:
+      break;
   }
   
-  delay(10);
+  // LED indicator: ON when connected.
+  digitalWrite(LED_BUILTIN, (state == AGENT_CONNECTED) ? HIGH : LOW);
 }
