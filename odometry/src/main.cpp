@@ -13,14 +13,14 @@
 #include <geometry_msgs/msg/transform_stamped.h>
 
 // Hardware Definitions
-#define RIGHT_FRONT_ENC_A 6
-#define RIGHT_FRONT_ENC_B 7
+#define RIGHT_FRONT_ENC_A 7
+#define RIGHT_FRONT_ENC_B 6
 #define LEFT_FRONT_ENC_A 8
 #define LEFT_FRONT_ENC_B 9
 #define LEFT_REAR_ENC_A 32
 #define LEFT_REAR_ENC_B 33
-#define RIGHT_REAR_ENC_A 36
-#define RIGHT_REAR_ENC_B 37
+#define RIGHT_REAR_ENC_A 37
+#define RIGHT_REAR_ENC_B 36
 
 #define RIGHT_FRONT 0
 #define LEFT_FRONT  1
@@ -28,7 +28,7 @@
 #define RIGHT_REAR  3
 
 // Robot parameters
-#define WHEEL_RADIUS 0.33                // meters
+#define WHEEL_RADIUS 0.12                // meters
 #define WHEEL_SEPARATION 0.122           // meters
 #define ENCODER_COUNTS_PER_REV 1700      // counts per revolution
 
