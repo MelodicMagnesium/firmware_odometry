@@ -22,6 +22,16 @@
 // Hardware and Robot Configuration Constants
 // ------------------------------
 
+// PID constants - these may need tuning for your specific robot
+#define KP 1.5
+#define KI 0.05
+#define KD 0.1
+
+// Variables for PID control
+float integral[4] = {0.0, 0.0, 0.0, 0.0};
+float prev_error[4] = {0.0, 0.0, 0.0, 0.0};
+int pwm_offsets[4] = {0, 0, 0, 0};
+
 // Motor indices
 #define RIGHT_FRONT 0
 #define LEFT_FRONT  1
@@ -203,6 +213,30 @@ void MOTOR_PWM_CONTROL(int motor, int pwm) {
   }
 }
 
+void updatePID() {
+  // Use the average wheel speed as the target
+  int32_t avg_speed = (wheels_spin_msg.data.data[LEFT_FRONT] + 
+                      wheels_spin_msg.data.data[RIGHT_FRONT] +
+                      wheels_spin_msg.data.data[LEFT_REAR] + 
+                      wheels_spin_msg.data.data[RIGHT_REAR]) / 4;
+  
+  // Calculate PID for each motor
+  for(int i = 0; i < 4; i++) {
+    float error = avg_speed - wheels_spin_msg.data.data[i];
+    integral[i] += error;
+    float derivative = error - prev_error[i];
+    
+    // Calculate PID output
+    pwm_offsets[i] = (KP * error) + (KI * integral[i]) + (KD * derivative);
+    
+    // Limit integral windup
+    if(integral[i] > 255) integral[i] = 255;
+    if(integral[i] < -255) integral[i] = -255;
+    
+    prev_error[i] = error;
+  }
+}
+
 // ------------------------------
 // Differential Drive: Compute and apply motor commands from cmd_vel
 // ------------------------------
@@ -212,20 +246,28 @@ void applyCmdVel() {
   float left_speed = v - (w * WHEEL_SEPARATION / 2.0);
   float right_speed = v + (w * WHEEL_SEPARATION / 2.0);
   
-  int left_pwm = (int) constrain((left_speed / MAX_LINEAR_VELOCITY) * 255, -255, 255);
-  int right_pwm = (int) constrain((right_speed / MAX_LINEAR_VELOCITY) * 255, -255, 255);
+  int base_left_pwm = (int) constrain((left_speed / MAX_LINEAR_VELOCITY) * 255, -255, 255);
+  int base_right_pwm = (int) constrain((right_speed / MAX_LINEAR_VELOCITY) * 255, -255, 255);
   
-  MOTOR_PWM_CONTROL(LEFT_FRONT, left_pwm);
-  MOTOR_PWM_CONTROL(LEFT_REAR, left_pwm);
-  MOTOR_PWM_CONTROL(RIGHT_FRONT, right_pwm);
-  MOTOR_PWM_CONTROL(RIGHT_REAR, right_pwm);
+  // Apply PID corrections to each motor
+  int left_front_pwm = constrain(base_left_pwm + pwm_offsets[LEFT_FRONT], -255, 255);
+  int left_rear_pwm = constrain(base_left_pwm + pwm_offsets[LEFT_REAR], -255, 255);
+  int right_front_pwm = constrain(base_right_pwm + pwm_offsets[RIGHT_FRONT], -255, 255);
+  int right_rear_pwm = constrain(base_right_pwm + pwm_offsets[RIGHT_REAR], -255, 255);
   
-  // Publish calculated PWM values on "chatter" for debugging
+  MOTOR_PWM_CONTROL(LEFT_FRONT, left_front_pwm);
+  MOTOR_PWM_CONTROL(LEFT_REAR, left_rear_pwm);
+  MOTOR_PWM_CONTROL(RIGHT_FRONT, right_front_pwm);
+  MOTOR_PWM_CONTROL(RIGHT_REAR, right_rear_pwm);
+  
+  // Update debug message
   char pwm_buffer[100];
-  snprintf(pwm_buffer, sizeof(pwm_buffer), "LF: %d, LR: %d, RF: %d, RR: %d", left_pwm, left_pwm, right_pwm, right_pwm);
+  snprintf(pwm_buffer, sizeof(pwm_buffer), "LF: %d, LR: %d, RF: %d, RR: %d", 
+           left_front_pwm, left_rear_pwm, right_front_pwm, right_rear_pwm);
   rosidl_runtime_c__String__assign(&chatter_msg.data, pwm_buffer);
   rcl_publish(&chatter_publisher, &chatter_msg, NULL);
 }
+
 
 // ------------------------------
 // Timer Callback: Publish odometry, TF, and wheels_spin messages
@@ -303,6 +345,7 @@ void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
   wheels_spin_msg.data.data[LEFT_REAR] = delta_lr;
   wheels_spin_msg.data.data[RIGHT_REAR] = delta_rr;
   rcl_publish(&wheels_spin_publisher, &wheels_spin_msg, NULL);
+  updatePID();
 }
 
 // ------------------------------
