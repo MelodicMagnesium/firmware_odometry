@@ -27,8 +27,8 @@
 #define RIGHT_REAR  3
 
 // Motor Pin Definitions
-#define RIGHT_FRONT_ENC_A 6
-#define RIGHT_FRONT_ENC_B 7
+#define RIGHT_FRONT_ENC_A 7
+#define RIGHT_FRONT_ENC_B 6
 #define RIGHT_FRONT_MOTOR_DIR 23
 #define RIGHT_FRONT_PWM 2
 
@@ -42,8 +42,8 @@
 #define LEFT_REAR_MOTOR_DIR 40
 #define LEFT_REAR_PWM 4
 
-#define RIGHT_REAR_ENC_A 36
-#define RIGHT_REAR_ENC_B 37
+#define RIGHT_REAR_ENC_A 37
+#define RIGHT_REAR_ENC_B 36
 #define RIGHT_REAR_MOTOR_DIR 41
 #define RIGHT_REAR_PWM 5
 
@@ -165,7 +165,7 @@ void MOTOR_PWM_CONTROL(int motor, int pwm) {
   
   // Set motor direction and PWM using motor index
   if (motor == LEFT_FRONT) {
-    if (pwm >= 0) {
+    if (pwm <= 0) {
       digitalWrite(LEFT_FRONT_MOTOR_DIR, HIGH);
       analogWrite(LEFT_FRONT_PWM, pwm);
     } else {
@@ -183,7 +183,7 @@ void MOTOR_PWM_CONTROL(int motor, int pwm) {
     }
   }
   else if (motor == LEFT_REAR) {
-    if (pwm >= 0) {
+    if (pwm <= 0) {
       digitalWrite(LEFT_REAR_MOTOR_DIR, HIGH);
       analogWrite(LEFT_REAR_PWM, pwm);
     } else {
