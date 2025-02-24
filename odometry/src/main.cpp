@@ -17,7 +17,7 @@
 #include <rosidl_runtime_c/string_functions.h>
 
 // ------------------------------
-// Robot & Motor Configuration Constants
+// Hardware and Robot Configuration Constants
 // ------------------------------
 
 // Motor indices
@@ -26,7 +26,7 @@
 #define LEFT_REAR   2
 #define RIGHT_REAR  3
 
-// Motor Pin Definitions (as in robot_config.h)
+// Motor Pin Definitions
 #define RIGHT_FRONT_ENC_A 6
 #define RIGHT_FRONT_ENC_B 7
 #define RIGHT_FRONT_MOTOR_DIR 23
@@ -47,19 +47,18 @@
 #define RIGHT_REAR_MOTOR_DIR 41
 #define RIGHT_REAR_PWM 5
 
-// PWM and resolution
-#define PWM_RESOLUTION 8    // 8-bit PWM (0-255)
-  
-// Robot physical parameters (from robot_config.h)
-#define WHEEL_RADIUS 0.33   // meters
-#define WHEEL_SEPARATION 0.122  // meters
-#define TURNING_RADIUS 0.080    // meters
+// PWM resolution (8-bit)
+#define PWM_RESOLUTION 8
+
+// Robot physical parameters
+#define WHEEL_RADIUS 0.33          // meters
+#define WHEEL_SEPARATION 0.122     // meters
 #define ENCODER_COUNTS_PER_REV 1700
 #define MAX_RPM 300
 
-// Velocity limits (computed from above)
+// Compute velocity limits
 #define MAX_LINEAR_VELOCITY (WHEEL_RADIUS * 2 * PI * MAX_RPM / 60)
-#define MAX_ANGULAR_VELOCITY (MAX_LINEAR_VELOCITY / TURNING_RADIUS)
+#define MAX_ANGULAR_VELOCITY (MAX_LINEAR_VELOCITY / 0.080)  // TURNING_RADIUS assumed = 0.080
 #define MIN_LINEAR_VELOCITY (-MAX_LINEAR_VELOCITY)
 #define MIN_ANGULAR_VELOCITY (-MAX_ANGULAR_VELOCITY)
 
@@ -73,11 +72,11 @@ float x_pos = 0.0;
 float y_pos = 0.0;
 float theta = 0.0;
 
-// Target velocities updated via cmd_vel [LINEAR_X, ANGULAR]
+// Global variable to hold desired velocities [linear, angular]
 float goal_velocity[2] = {0.0, 0.0};
 
 // ------------------------------
-// Micro-ROS globals
+// Micro-ROS Globals
 // ------------------------------
 rclc_support_t support;
 rcl_node_t node;
@@ -94,12 +93,12 @@ geometry_msgs__msg__TransformStamped transform_msg;
 rcl_subscription_t cmd_vel_subscriber;
 geometry_msgs__msg__Twist cmd_vel_msg;
 
-// (Optional) For debugging: publisher on "chatter" (we use this to republish cmd_vel as a string)
+// Publisher for debugging: Publish motor PWM values on "chatter"
 rcl_publisher_t chatter_publisher;
 std_msgs__msg__String chatter_msg;
 
 // ------------------------------
-// Connection state
+// Connection state for micro-ROS
 // ------------------------------
 enum states {
   WAITING_AGENT,
@@ -114,8 +113,8 @@ enum states {
 #define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){return false;}}
 #define EXECUTE_EVERY_N_MS(MS, X) do { \
   static volatile int64_t init = -1; \
-  if (init == -1) { init = uxr_millis();} \
-  if (uxr_millis() - init > MS) { X; init = uxr_millis();} \
+  if (init == -1) { init = uxr_millis(); } \
+  if (uxr_millis() - init > (MS)) { X; init = uxr_millis(); } \
 } while (0)
 
 // ------------------------------
@@ -157,14 +156,14 @@ void MotorISR_RIGHT_REAR() {
 // Motor PWM Control Function
 // ------------------------------
 void MOTOR_PWM_CONTROL(int motor, int pwm) {
-  // Limit pwm to 8-bit range (-255 to 255)
+  // Constrain pwm to 8-bit range (-255 to 255)
   if (pwm > 255) {
     pwm = 255;
   } else if (pwm < -255) {
     pwm = -255;
   }
   
-  // Depending on motor index, set direction and PWM value
+  // Set motor direction and PWM using motor index
   if (motor == LEFT_FRONT) {
     if (pwm >= 0) {
       digitalWrite(LEFT_FRONT_MOTOR_DIR, HIGH);
@@ -208,49 +207,54 @@ void MOTOR_PWM_CONTROL(int motor, int pwm) {
 // ------------------------------
 void applyCmdVel() {
   // Differential drive kinematics:
-  // v_left = v - (w * wheel_separation / 2)
-  // v_right = v + (w * wheel_separation / 2)
+  // left_speed = v - (w * wheel_separation / 2)
+  // right_speed = v + (w * wheel_separation / 2)
   float v = goal_velocity[0];
   float w = goal_velocity[1];
   float left_speed = v - (w * WHEEL_SEPARATION / 2.0);
   float right_speed = v + (w * WHEEL_SEPARATION / 2.0);
   
-  // Map speeds to PWM values (assume MAX_LINEAR_VELOCITY corresponds to full scale, 255)
+  // Map speeds to PWM (assuming MAX_LINEAR_VELOCITY maps to full scale, 255)
   int left_pwm = (int) constrain((left_speed / MAX_LINEAR_VELOCITY) * 255, -255, 255);
   int right_pwm = (int) constrain((right_speed / MAX_LINEAR_VELOCITY) * 255, -255, 255);
   
+  // Apply motor commands
   MOTOR_PWM_CONTROL(LEFT_FRONT, left_pwm);
   MOTOR_PWM_CONTROL(LEFT_REAR, left_pwm);
   MOTOR_PWM_CONTROL(RIGHT_FRONT, right_pwm);
   MOTOR_PWM_CONTROL(RIGHT_REAR, right_pwm);
+  
+  // Publish the calculated PWM values on "chatter"
+  char pwm_buffer[100];
+  snprintf(pwm_buffer, sizeof(pwm_buffer), "LF: %d, LR: %d, RF: %d, RR: %d", left_pwm, left_pwm, right_pwm, right_pwm);
+  rosidl_runtime_c__String__assign(&chatter_msg.data, pwm_buffer);
+  rcl_publish(&chatter_publisher, &chatter_msg, NULL);
 }
 
 // ------------------------------
-// Micro-ROS Timer Callback: Publish odom and TF messages
+// Micro-ROS Timer Callback: Publish odometry and TF messages
 // ------------------------------
 void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
   RCLC_UNUSED(last_call_time);
   if (timer == NULL) return;
-
-  float dt = 0.02;  // Timer period: 20ms
+  
+  float dt = 0.02;  // 20ms
 
   // Compute tick differences for each wheel
   int32_t delta_rf = encoder_data[RIGHT_FRONT] - last_encoder_data[RIGHT_FRONT];
-  int32_t delta_lf = encoder_data[LEFT_FRONT]  - last_encoder_data[LEFT_FRONT];
-  int32_t delta_lr = encoder_data[LEFT_REAR]   - last_encoder_data[LEFT_REAR];
-  int32_t delta_rr = encoder_data[RIGHT_REAR]  - last_encoder_data[RIGHT_REAR];
+  int32_t delta_lf = encoder_data[LEFT_FRONT] - last_encoder_data[LEFT_FRONT];
+  int32_t delta_lr = encoder_data[LEFT_REAR] - last_encoder_data[LEFT_REAR];
+  int32_t delta_rr = encoder_data[RIGHT_REAR] - last_encoder_data[RIGHT_REAR];
 
   // Update last encoder counts
   last_encoder_data[RIGHT_FRONT] = encoder_data[RIGHT_FRONT];
-  last_encoder_data[LEFT_FRONT]  = encoder_data[LEFT_FRONT];
-  last_encoder_data[LEFT_REAR]   = encoder_data[LEFT_REAR];
-  last_encoder_data[RIGHT_REAR]  = encoder_data[RIGHT_REAR];
+  last_encoder_data[LEFT_FRONT] = encoder_data[LEFT_FRONT];
+  last_encoder_data[LEFT_REAR] = encoder_data[LEFT_REAR];
+  last_encoder_data[RIGHT_REAR] = encoder_data[RIGHT_REAR];
 
-  // Average ticks for left and right sides
-  int32_t delta_left  = (delta_lf + delta_lr) / 2;
+  int32_t delta_left = (delta_lf + delta_lr) / 2;
   int32_t delta_right = (delta_rf + delta_rr) / 2;
 
-  // Convert ticks to distance
   float distance_per_tick = (2.0 * PI * WHEEL_RADIUS) / ENCODER_COUNTS_PER_REV;
   float left_distance = delta_left * distance_per_tick;
   float right_distance = delta_right * distance_per_tick;
@@ -258,18 +262,17 @@ void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
   float delta_s = (left_distance + right_distance) / 2.0;
   float delta_theta = (right_distance - left_distance) / WHEEL_SEPARATION;
 
-  // Update odometry (using midpoint integration)
+  // Update odometry using midpoint integration
   x_pos += delta_s * cos(theta + delta_theta / 2.0);
   y_pos += delta_s * sin(theta + delta_theta / 2.0);
   theta += delta_theta;
 
   unsigned long ms = millis();
-
+  // Ensure valid frame IDs (set each time to avoid empty frames)
   odom_msg.header.frame_id.data = (char*)"odom";
   odom_msg.child_frame_id.data = (char*)"base_link";
   transform_msg.header.frame_id.data = (char*)"odom";
   transform_msg.child_frame_id.data = (char*)"base_link";
-
 
   odom_msg.header.stamp.sec = ms / 1000;
   odom_msg.header.stamp.nanosec = (ms % 1000) * 1000000;
@@ -301,12 +304,11 @@ void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
 }
 
 // ------------------------------
-// Command Velocity Callback (updates global goal_velocity)
+// Command Velocity Callback: Update goal_velocity from cmd_vel message
 // ------------------------------
 void commandVelocityCallback(const geometry_msgs__msg__Twist * msg) {
   goal_velocity[0] = msg->linear.x;
   goal_velocity[1] = msg->angular.z;
-
   // Constrain values
   goal_velocity[0] = constrain(goal_velocity[0], MIN_LINEAR_VELOCITY, MAX_LINEAR_VELOCITY);
   goal_velocity[1] = constrain(goal_velocity[1], MIN_ANGULAR_VELOCITY, MAX_ANGULAR_VELOCITY);
@@ -316,16 +318,10 @@ void commandVelocityCallback(const geometry_msgs__msg__Twist * msg) {
 void cmd_vel_callback(const void * msgin) {
   const geometry_msgs__msg__Twist * msg = (const geometry_msgs__msg__Twist *) msgin;
   commandVelocityCallback(msg);
-  
-  // (Optional) Republish a debug string on "chatter"
-  char buffer[100];
-  snprintf(buffer, sizeof(buffer), "cmd_vel: linear.x=%.2f, angular.z=%.2f", msg->linear.x, msg->angular.z);
-  rosidl_runtime_c__String__assign(&chatter_msg.data, buffer);
-  rcl_publish(&chatter_publisher, &chatter_msg, NULL);
 }
 
 // ------------------------------
-// micro-ROS entity creation: publishers, subscription, timer, executor
+// micro-ROS Entity Creation: Publishers, Subscription, Timer, Executor
 // ------------------------------
 bool create_entities() {
   allocator = rcl_get_default_allocator();
@@ -372,7 +368,7 @@ bool create_entities() {
   RCCHECK(rclc_executor_add_timer(&executor, &timer));
   RCCHECK(rclc_executor_add_subscription(&executor, &cmd_vel_subscriber, &cmd_vel_msg, cmd_vel_callback, ON_NEW_DATA));
 
-  // Initialize chatter message string (pre-allocate an empty string)
+  // Initialize chatter message (pre-allocate an empty string)
   rosidl_runtime_c__String__init(&chatter_msg.data);
 
   return true;
@@ -393,7 +389,7 @@ void destroy_entities() {
 }
 
 // ------------------------------
-// Hardware Initialization: motor pins, encoder pins, PWM setup, etc.
+// Hardware Initialization: Set motor PWM resolution, pin modes, and attach encoder interrupts
 // ------------------------------
 void initHardware() {
   // Set motor PWM resolution and frequencies
@@ -403,7 +399,7 @@ void initHardware() {
   analogWriteFrequency(LEFT_REAR_PWM, 375000);
   analogWriteFrequency(RIGHT_REAR_PWM, 375000);
 
-  // Set encoder pins (INPUT_PULLUP)
+  // Set encoder pins
   pinMode(RIGHT_FRONT_ENC_A, INPUT_PULLUP);
   pinMode(RIGHT_FRONT_ENC_B, INPUT_PULLUP);
   pinMode(LEFT_FRONT_ENC_A, INPUT_PULLUP);
@@ -416,13 +412,10 @@ void initHardware() {
   // Set motor direction and PWM pins as OUTPUT
   pinMode(LEFT_FRONT_MOTOR_DIR, OUTPUT);
   pinMode(LEFT_FRONT_PWM, OUTPUT);
-  
   pinMode(RIGHT_FRONT_MOTOR_DIR, OUTPUT);
   pinMode(RIGHT_FRONT_PWM, OUTPUT);
-  
   pinMode(LEFT_REAR_MOTOR_DIR, OUTPUT);
   pinMode(LEFT_REAR_PWM, OUTPUT);
-  
   pinMode(RIGHT_REAR_MOTOR_DIR, OUTPUT);
   pinMode(RIGHT_REAR_PWM, OUTPUT);
 
@@ -434,21 +427,17 @@ void initHardware() {
 }
 
 // ------------------------------
-// Setup: initialize hardware and micro-ROS
+// Setup: Initialize Serial, hardware, and micro-ROS transport
 // ------------------------------
 void setup() {
-  // Initialize Serial and micro-ROS transport
   Serial.begin(2000000);
   set_microros_serial_transports(Serial);
-
-  // Initialize hardware (motors, encoders, PWM)
   initHardware();
-
   state = WAITING_AGENT;
 }
 
 // ------------------------------
-// Main Loop: Process micro-ROS and update motor commands based on cmd_vel
+// Main Loop: Process micro-ROS executor and apply cmd_vel motor commands
 // ------------------------------
 void loop() {
   switch (state) {
@@ -469,7 +458,7 @@ void loop() {
       );
       if (state == AGENT_CONNECTED) {
         rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100));
-        // Apply the latest command velocities to drive motors
+        // Update motor commands based on latest goal velocities
         applyCmdVel();
       }
       break;
