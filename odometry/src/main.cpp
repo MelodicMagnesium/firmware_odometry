@@ -14,7 +14,9 @@
 #include <geometry_msgs/msg/transform_stamped.h>
 #include <geometry_msgs/msg/twist.h>
 #include <std_msgs/msg/string.h>
+#include <std_msgs/msg/int64_multi_array.h>
 #include <rosidl_runtime_c/string_functions.h>
+#include <rosidl_runtime_c/primitives_sequence_functions.h>
 
 // ------------------------------
 // Hardware and Robot Configuration Constants
@@ -97,6 +99,10 @@ geometry_msgs__msg__Twist cmd_vel_msg;
 rcl_publisher_t chatter_publisher;
 std_msgs__msg__String chatter_msg;
 
+// NEW: Publisher for individual wheel odometry ("wheels_spin")
+rcl_publisher_t wheels_spin_publisher;
+std_msgs__msg__Int64MultiArray wheels_spin_msg;
+
 // ------------------------------
 // Connection state for micro-ROS
 // ------------------------------
@@ -156,20 +162,15 @@ void MotorISR_RIGHT_REAR() {
 // Motor PWM Control Function
 // ------------------------------
 void MOTOR_PWM_CONTROL(int motor, int pwm) {
-  // Constrain pwm to 8-bit range (-255 to 255)
-  if (pwm > 255) {
-    pwm = 255;
-  } else if (pwm < -255) {
-    pwm = -255;
-  }
+  if (pwm > 255) pwm = 255;
+  else if (pwm < -255) pwm = -255;
   
-  // Set motor direction and PWM using motor index
   if (motor == LEFT_FRONT) {
-    if (pwm <= 0) {
-      digitalWrite(LEFT_FRONT_MOTOR_DIR, HIGH);
+    if (pwm >= 0) {
+      digitalWrite(LEFT_FRONT_MOTOR_DIR, LOW);
       analogWrite(LEFT_FRONT_PWM, pwm);
     } else {
-      digitalWrite(LEFT_FRONT_MOTOR_DIR, LOW);
+      digitalWrite(LEFT_FRONT_MOTOR_DIR, HIGH);
       analogWrite(LEFT_FRONT_PWM, abs(pwm));
     }
   }
@@ -183,11 +184,11 @@ void MOTOR_PWM_CONTROL(int motor, int pwm) {
     }
   }
   else if (motor == LEFT_REAR) {
-    if (pwm <= 0) {
-      digitalWrite(LEFT_REAR_MOTOR_DIR, HIGH);
+    if (pwm >= 0) {
+      digitalWrite(LEFT_REAR_MOTOR_DIR, LOW);
       analogWrite(LEFT_REAR_PWM, pwm);
     } else {
-      digitalWrite(LEFT_REAR_MOTOR_DIR, LOW);
+      digitalWrite(LEFT_REAR_MOTOR_DIR, HIGH);
       analogWrite(LEFT_REAR_PWM, abs(pwm));
     }
   }
@@ -206,25 +207,20 @@ void MOTOR_PWM_CONTROL(int motor, int pwm) {
 // Differential Drive: Compute and apply motor commands from cmd_vel
 // ------------------------------
 void applyCmdVel() {
-  // Differential drive kinematics:
-  // left_speed = v - (w * wheel_separation / 2)
-  // right_speed = v + (w * wheel_separation / 2)
   float v = goal_velocity[0];
   float w = goal_velocity[1];
   float left_speed = v - (w * WHEEL_SEPARATION / 2.0);
   float right_speed = v + (w * WHEEL_SEPARATION / 2.0);
   
-  // Map speeds to PWM (assuming MAX_LINEAR_VELOCITY maps to full scale, 255)
   int left_pwm = (int) constrain((left_speed / MAX_LINEAR_VELOCITY) * 255, -255, 255);
   int right_pwm = (int) constrain((right_speed / MAX_LINEAR_VELOCITY) * 255, -255, 255);
   
-  // Apply motor commands
   MOTOR_PWM_CONTROL(LEFT_FRONT, left_pwm);
   MOTOR_PWM_CONTROL(LEFT_REAR, left_pwm);
   MOTOR_PWM_CONTROL(RIGHT_FRONT, right_pwm);
   MOTOR_PWM_CONTROL(RIGHT_REAR, right_pwm);
   
-  // Publish the calculated PWM values on "chatter"
+  // Publish calculated PWM values on "chatter" for debugging
   char pwm_buffer[100];
   snprintf(pwm_buffer, sizeof(pwm_buffer), "LF: %d, LR: %d, RF: %d, RR: %d", left_pwm, left_pwm, right_pwm, right_pwm);
   rosidl_runtime_c__String__assign(&chatter_msg.data, pwm_buffer);
@@ -232,7 +228,7 @@ void applyCmdVel() {
 }
 
 // ------------------------------
-// Micro-ROS Timer Callback: Publish odometry and TF messages
+// Timer Callback: Publish odometry, TF, and wheels_spin messages
 // ------------------------------
 void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
   RCLC_UNUSED(last_call_time);
@@ -240,13 +236,11 @@ void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
   
   float dt = 0.02;  // 20ms
 
-  // Compute tick differences for each wheel
   int32_t delta_rf = encoder_data[RIGHT_FRONT] - last_encoder_data[RIGHT_FRONT];
   int32_t delta_lf = encoder_data[LEFT_FRONT] - last_encoder_data[LEFT_FRONT];
   int32_t delta_lr = encoder_data[LEFT_REAR] - last_encoder_data[LEFT_REAR];
   int32_t delta_rr = encoder_data[RIGHT_REAR] - last_encoder_data[RIGHT_REAR];
 
-  // Update last encoder counts
   last_encoder_data[RIGHT_FRONT] = encoder_data[RIGHT_FRONT];
   last_encoder_data[LEFT_FRONT] = encoder_data[LEFT_FRONT];
   last_encoder_data[LEFT_REAR] = encoder_data[LEFT_REAR];
@@ -262,13 +256,12 @@ void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
   float delta_s = (left_distance + right_distance) / 2.0;
   float delta_theta = (right_distance - left_distance) / WHEEL_SEPARATION;
 
-  // Update odometry using midpoint integration
   x_pos += delta_s * cos(theta + delta_theta / 2.0);
   y_pos += delta_s * sin(theta + delta_theta / 2.0);
   theta += delta_theta;
 
   unsigned long ms = millis();
-  // Ensure valid frame IDs (set each time to avoid empty frames)
+  // Set frame IDs to avoid empty frame errors
   odom_msg.header.frame_id.data = (char*)"odom";
   odom_msg.child_frame_id.data = (char*)"base_link";
   transform_msg.header.frame_id.data = (char*)"odom";
@@ -301,6 +294,15 @@ void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
 
   rcl_publish(&odom_publisher, &odom_msg, NULL);
   rcl_publish(&tf_publisher, &tf_msg, NULL);
+
+  // NEW: Publish individual wheel spin (tick differences) on "wheels_spin"
+  // For a primitive sequence, access the underlying data pointer via wheels_spin_msg.data.data
+  wheels_spin_msg.data.size = 4; // set the size to 4 elements
+  wheels_spin_msg.data.data[LEFT_FRONT] = delta_lf;
+  wheels_spin_msg.data.data[RIGHT_FRONT] = delta_rf;
+  wheels_spin_msg.data.data[LEFT_REAR] = delta_lr;
+  wheels_spin_msg.data.data[RIGHT_REAR] = delta_rr;
+  rcl_publish(&wheels_spin_publisher, &wheels_spin_msg, NULL);
 }
 
 // ------------------------------
@@ -309,7 +311,6 @@ void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
 void commandVelocityCallback(const geometry_msgs__msg__Twist * msg) {
   goal_velocity[0] = msg->linear.x;
   goal_velocity[1] = msg->angular.z;
-  // Constrain values
   goal_velocity[0] = constrain(goal_velocity[0], MIN_LINEAR_VELOCITY, MAX_LINEAR_VELOCITY);
   goal_velocity[1] = constrain(goal_velocity[1], MIN_ANGULAR_VELOCITY, MAX_ANGULAR_VELOCITY);
 }
@@ -328,7 +329,6 @@ bool create_entities() {
   RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
   RCCHECK(rclc_node_init_default(&node, "micro_ros_cmdvel_motor_control", "", &support));
 
-  // Create publishers for odom, tf, and chatter
   RCCHECK(rclc_publisher_init_default(
     &odom_publisher,
     &node,
@@ -347,14 +347,24 @@ bool create_entities() {
     ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
     "chatter"));
 
-  // Create subscription for cmd_vel
+  RCCHECK(rclc_publisher_init_default(
+    &wheels_spin_publisher,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int64MultiArray),
+    "wheels_spin"));
+
+  // Initialize wheels_spin_msg.data as a sequence with capacity 4
+  if (!rosidl_runtime_c__int64__Sequence__init(&wheels_spin_msg.data, 4)) {
+    return false;
+  }
+  wheels_spin_msg.data.size = 4;
+
   RCCHECK(rclc_subscription_init_default(
     &cmd_vel_subscriber,
     &node,
     ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
     "cmd_vel"));
 
-  // Create timer (50Hz)
   const unsigned int timer_timeout = 20;
   RCCHECK(rclc_timer_init_default(
     &timer,
@@ -362,13 +372,11 @@ bool create_entities() {
     RCL_MS_TO_NS(timer_timeout),
     timer_callback));
 
-  // Create executor (2 handles: timer and subscription)
   executor = rclc_executor_get_zero_initialized_executor();
   RCCHECK(rclc_executor_init(&executor, &support.context, 2, &allocator));
   RCCHECK(rclc_executor_add_timer(&executor, &timer));
   RCCHECK(rclc_executor_add_subscription(&executor, &cmd_vel_subscriber, &cmd_vel_msg, cmd_vel_callback, ON_NEW_DATA));
 
-  // Initialize chatter message (pre-allocate an empty string)
   rosidl_runtime_c__String__init(&chatter_msg.data);
 
   return true;
@@ -381,25 +389,26 @@ void destroy_entities() {
   rcl_publisher_fini(&odom_publisher, &node);
   rcl_publisher_fini(&tf_publisher, &node);
   rcl_publisher_fini(&chatter_publisher, &node);
+  rcl_publisher_fini(&wheels_spin_publisher, &node);
   rcl_subscription_fini(&cmd_vel_subscriber, &node);
   rcl_timer_fini(&timer);
   rclc_executor_fini(&executor);
   rcl_node_fini(&node);
   rclc_support_fini(&support);
+  
+  rosidl_runtime_c__int64__Sequence__fini(&wheels_spin_msg.data);
 }
 
 // ------------------------------
 // Hardware Initialization: Set motor PWM resolution, pin modes, and attach encoder interrupts
 // ------------------------------
 void initHardware() {
-  // Set motor PWM resolution and frequencies
   analogWriteResolution(PWM_RESOLUTION);
   analogWriteFrequency(LEFT_FRONT_PWM, 375000);
   analogWriteFrequency(RIGHT_FRONT_PWM, 375000);
   analogWriteFrequency(LEFT_REAR_PWM, 375000);
   analogWriteFrequency(RIGHT_REAR_PWM, 375000);
 
-  // Set encoder pins
   pinMode(RIGHT_FRONT_ENC_A, INPUT_PULLUP);
   pinMode(RIGHT_FRONT_ENC_B, INPUT_PULLUP);
   pinMode(LEFT_FRONT_ENC_A, INPUT_PULLUP);
@@ -409,7 +418,6 @@ void initHardware() {
   pinMode(RIGHT_REAR_ENC_A, INPUT_PULLUP);
   pinMode(RIGHT_REAR_ENC_B, INPUT_PULLUP);
 
-  // Set motor direction and PWM pins as OUTPUT
   pinMode(LEFT_FRONT_MOTOR_DIR, OUTPUT);
   pinMode(LEFT_FRONT_PWM, OUTPUT);
   pinMode(RIGHT_FRONT_MOTOR_DIR, OUTPUT);
@@ -419,7 +427,6 @@ void initHardware() {
   pinMode(RIGHT_REAR_MOTOR_DIR, OUTPUT);
   pinMode(RIGHT_REAR_PWM, OUTPUT);
 
-  // Attach encoder interrupts
   attachInterrupt(digitalPinToInterrupt(LEFT_FRONT_ENC_A), MotorISR_LEFT_FRONT, CHANGE);
   attachInterrupt(digitalPinToInterrupt(RIGHT_FRONT_ENC_A), MotorISR_RIGHT_FRONT, CHANGE);
   attachInterrupt(digitalPinToInterrupt(LEFT_REAR_ENC_A), MotorISR_LEFT_REAR, CHANGE);
@@ -437,7 +444,7 @@ void setup() {
 }
 
 // ------------------------------
-// Main Loop: Process micro-ROS executor and apply cmd_vel motor commands
+// Main Loop: Process micro-ROS executor and update motor commands based on cmd_vel
 // ------------------------------
 void loop() {
   switch (state) {
@@ -458,7 +465,7 @@ void loop() {
       );
       if (state == AGENT_CONNECTED) {
         rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100));
-        // Update motor commands based on latest goal velocities
+        // Update motor commands based on latest goal velocities and publish PWM values.
         applyCmdVel();
       }
       break;
