@@ -264,6 +264,13 @@ void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
   theta += delta_theta;
 
   unsigned long ms = millis();
+
+  odom_msg.header.frame_id.data = (char*)"odom";
+  odom_msg.child_frame_id.data = (char*)"base_link";
+  transform_msg.header.frame_id.data = (char*)"odom";
+  transform_msg.child_frame_id.data = (char*)"base_link";
+
+
   odom_msg.header.stamp.sec = ms / 1000;
   odom_msg.header.stamp.nanosec = (ms % 1000) * 1000000;
 
