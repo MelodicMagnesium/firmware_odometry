@@ -23,9 +23,13 @@
 // ------------------------------
 
 // PID constants - these may need tuning for your specific robot
-#define KP 1.5
-#define KI 0.05
-#define KD 0.1
+#define KP 3.5
+#define KI 0.3
+#define KD 1.0
+
+// Expected wheel ticks per timer interval based on commanded velocity
+int32_t expected_ticks_left = 0;
+int32_t expected_ticks_right = 0;
 
 // Variables for PID control
 float integral[4] = {0.0, 0.0, 0.0, 0.0};
@@ -64,7 +68,7 @@ int pwm_offsets[4] = {0, 0, 0, 0};
 
 // Robot physical parameters
 #define WHEEL_RADIUS 0.33          // meters
-#define WHEEL_SEPARATION 0.122     // meters
+#define WHEEL_SEPARATION 0.85     // meters
 #define ENCODER_COUNTS_PER_REV 1700
 #define MAX_RPM 300
 
@@ -213,28 +217,68 @@ void MOTOR_PWM_CONTROL(int motor, int pwm) {
   }
 }
 
-void updatePID() {
-  // Use the average wheel speed as the target
-  int32_t avg_speed = (wheels_spin_msg.data.data[LEFT_FRONT] + 
-                      wheels_spin_msg.data.data[RIGHT_FRONT] +
-                      wheels_spin_msg.data.data[LEFT_REAR] + 
-                      wheels_spin_msg.data.data[RIGHT_REAR]) / 4;
+// Convert linear and angular velocity to expected encoder ticks
+void updateExpectedTicks() {
+  float v = goal_velocity[0];
+  float w = goal_velocity[1];
   
-  // Calculate PID for each motor
+  // Calculate expected wheel velocities in m/s
+  float left_vel = v - (w * WHEEL_SEPARATION / 2.0);
+  float right_vel = v + (w * WHEEL_SEPARATION / 2.0);
+  
+  // Convert velocities to expected ticks per interval (dt = 0.02s)
+  float dt = 0.02;  // 20ms timer interval
+  float distance_per_tick = (2.0 * PI * WHEEL_RADIUS) / ENCODER_COUNTS_PER_REV;
+  
+  expected_ticks_left = (int32_t)(left_vel * dt / distance_per_tick);
+  expected_ticks_right = (int32_t)(right_vel * dt / distance_per_tick);
+}
+
+void updatePID() {
+  // Update expected ticks based on current commanded velocity
+  updateExpectedTicks();
+  
+  // Calculate PID for left front motor
+  float error_lf = expected_ticks_left - wheels_spin_msg.data.data[LEFT_FRONT];
+  integral[LEFT_FRONT] += error_lf;
+  float derivative_lf = error_lf - prev_error[LEFT_FRONT];
+  pwm_offsets[LEFT_FRONT] = (KP * error_lf) + (KI * integral[LEFT_FRONT]) + (KD * derivative_lf);
+  prev_error[LEFT_FRONT] = error_lf;
+  
+  // Calculate PID for left rear motor
+  float error_lr = expected_ticks_left - wheels_spin_msg.data.data[LEFT_REAR];
+  integral[LEFT_REAR] += error_lr;
+  float derivative_lr = error_lr - prev_error[LEFT_REAR];
+  pwm_offsets[LEFT_REAR] = (KP * error_lr) + (KI * integral[LEFT_REAR]) + (KD * derivative_lr);
+  prev_error[LEFT_REAR] = error_lr;
+  
+  // Calculate PID for right front motor
+  float error_rf = expected_ticks_right - wheels_spin_msg.data.data[RIGHT_FRONT];
+  integral[RIGHT_FRONT] += error_rf;
+  float derivative_rf = error_rf - prev_error[RIGHT_FRONT];
+  pwm_offsets[RIGHT_FRONT] = (KP * error_rf) + (KI * integral[RIGHT_FRONT]) + (KD * derivative_rf);
+  prev_error[RIGHT_FRONT] = error_rf;
+  
+  // Calculate PID for right rear motor
+  float error_rr = expected_ticks_right - wheels_spin_msg.data.data[RIGHT_REAR];
+  integral[RIGHT_REAR] += error_rr;
+  float derivative_rr = error_rr - prev_error[RIGHT_REAR];
+  pwm_offsets[RIGHT_REAR] = (KP * error_rr) + (KI * integral[RIGHT_REAR]) + (KD * derivative_rr);
+  prev_error[RIGHT_REAR] = error_rr;
+  
+  // Limit integral windup for all motors
   for(int i = 0; i < 4; i++) {
-    float error = avg_speed - wheels_spin_msg.data.data[i];
-    integral[i] += error;
-    float derivative = error - prev_error[i];
-    
-    // Calculate PID output
-    pwm_offsets[i] = (KP * error) + (KI * integral[i]) + (KD * derivative);
-    
-    // Limit integral windup
     if(integral[i] > 255) integral[i] = 255;
     if(integral[i] < -255) integral[i] = -255;
-    
-    prev_error[i] = error;
   }
+  
+  // Debug message for PID values
+  char pid_buffer[100];
+  snprintf(pid_buffer, sizeof(pid_buffer), "Target L:%ld R:%ld Err LF:%0.1f LR:%0.1f RF:%0.1f RR:%0.1f", 
+           expected_ticks_left, expected_ticks_right,
+           error_lf, error_lr, error_rf, error_rr);
+  rosidl_runtime_c__String__assign(&chatter_msg.data, pid_buffer);
+  rcl_publish(&chatter_publisher, &chatter_msg, NULL);
 }
 
 // ------------------------------
@@ -352,10 +396,20 @@ void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
 // Command Velocity Callback: Update goal_velocity from cmd_vel message
 // ------------------------------
 void commandVelocityCallback(const geometry_msgs__msg__Twist * msg) {
+  float prev_linear = goal_velocity[0];
+  float prev_angular = goal_velocity[1];
+  
   goal_velocity[0] = msg->linear.x;
   goal_velocity[1] = msg->angular.z;
   goal_velocity[0] = constrain(goal_velocity[0], MIN_LINEAR_VELOCITY, MAX_LINEAR_VELOCITY);
   goal_velocity[1] = constrain(goal_velocity[1], MIN_ANGULAR_VELOCITY, MAX_ANGULAR_VELOCITY);
+  
+  // Reset PID integrals when velocity command changes significantly
+  if (fabs(prev_linear - goal_velocity[0]) > 0.05 || fabs(prev_angular - goal_velocity[1]) > 0.05) {
+    for(int i = 0; i < 4; i++) {
+      integral[i] = 0.0;
+    }
+  }
 }
 
 // micro-ROS cmd_vel subscription callback
